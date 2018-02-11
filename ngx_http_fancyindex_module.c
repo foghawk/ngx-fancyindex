@@ -26,6 +26,8 @@
 
 #include "template.h"
 
+#include "strnatcmp.h"
+
 #if defined(__GNUC__) && (__GNUC__ >= 3)
 # define ngx_force_inline __attribute__((__always_inline__))
 #else /* !__GNUC__ */
@@ -147,8 +149,10 @@ ngx_fancyindex_timefmt (u_char *buffer, const ngx_str_t *fmt, const ngx_tm_t *tm
  */
 typedef struct {
     ngx_flag_t enable;       /**< Module is enabled. */
-    ngx_uint_t default_sort; /**< Default sort criterion. */
+    ngx_uint_t default_sort; /**< Default sort attribute. */
+    ngx_flag_t default_desc; /**< Default sort direction. */
     ngx_flag_t dirs_first;   /**< Group directories together first when sorting */
+    ngx_flag_t nat_sort;     /**< Use natural rather than ASCIIbetical sort. */
     ngx_flag_t localtime;    /**< File mtime dates are sent in local time. */
     ngx_flag_t exact_size;   /**< Sizes are sent always in bytes. */
     ngx_uint_t name_length;  /**< Maximum length of file names in bytes. */
@@ -163,23 +167,15 @@ typedef struct {
     ngx_array_t *ignore;     /**< List of files to ignore in listings. */
 } ngx_http_fancyindex_loc_conf_t;
 
-#define NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME       0
-#define NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE       1
-#define NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE       2
-#define NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME_DESC  3
-#define NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE_DESC  4
-#define NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE_DESC  5
-
-static ngx_conf_enum_t ngx_http_fancyindex_sort_criteria[] = {
-    { ngx_string("name"), NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME },
-    { ngx_string("size"), NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE },
-    { ngx_string("date"), NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE },
-    { ngx_string("name_desc"), NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME_DESC },
-    { ngx_string("size_desc"), NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE_DESC },
-    { ngx_string("date_desc"), NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE_DESC },
+#define NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_NAME       0
+#define NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_SIZE       1
+#define NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_DATE       2
+static ngx_conf_enum_t ngx_http_fancyindex_sort_attributes[] = {
+    { ngx_string("name"), NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_NAME },
+    { ngx_string("size"), NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_SIZE },
+    { ngx_string("date"), NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_DATE },
     { ngx_null_string, 0 }
 };
-
 
 #define NGX_HTTP_FANCYINDEX_PREALLOCATE  50
 
@@ -226,22 +222,23 @@ typedef struct {
     off_t          size;
 } ngx_http_fancyindex_entry_t;
 
+typedef struct {
+    ngx_uint_t     type;
+    ngx_flag_t     descending;
+    ngx_flag_t     natural;
+    ngx_flag_t     dirs_first;
+} ngx_http_fancyindex_sortopts_t;
 
-
-static ngx_int_t ngx_libc_cdecl
-    ngx_http_fancyindex_cmp_entries_dirs_first(const void *one, const void *two);
-static ngx_int_t ngx_libc_cdecl
-    ngx_http_fancyindex_cmp_entries_name_desc(const void *one, const void *two);
-static ngx_int_t ngx_libc_cdecl
-    ngx_http_fancyindex_cmp_entries_size_desc(const void *one, const void *two);
-static ngx_int_t ngx_libc_cdecl
-    ngx_http_fancyindex_cmp_entries_mtime_desc(const void *one, const void *two);
-static ngx_int_t ngx_libc_cdecl
-    ngx_http_fancyindex_cmp_entries_name_asc(const void *one, const void *two);
-static ngx_int_t ngx_libc_cdecl
-    ngx_http_fancyindex_cmp_entries_size_asc(const void *one, const void *two);
-static ngx_int_t ngx_libc_cdecl
-    ngx_http_fancyindex_cmp_entries_mtime_asc(const void *one, const void *two);
+static int ngx_libc_cdecl
+#if defined(__clang__)
+    ngx_http_fancyindex_cmp_entries(void *o,
+                                    const void *one,
+                                    const void *two);
+#elif defined(__GNUC__)
+    ngx_http_fancyindex_cmp_entries(const void *one,
+                                    const void *two,
+                                    void *o);
+#endif
 
 static ngx_int_t ngx_http_fancyindex_error(ngx_http_request_t *r,
     ngx_dir_t *dir, ngx_str_t *name);
@@ -274,6 +271,16 @@ static ngx_inline ngx_buf_t*
     ngx_force_inline;
 
 
+/*
+//for natsort
+typedef unsigned char nat_char;
+int strnatcmp(nat_char const *a, nat_char const *b);
+int strnatcasecmp(nat_char const *a, nat_char const *b);
+#define nat_isdigit isdigit
+#define nat_isdigit isdigit
+#define nat_isspace isspace
+#define nat_toupper toupper
+*/
 
 static ngx_command_t  ngx_http_fancyindex_commands[] = {
 
@@ -289,7 +296,14 @@ static ngx_command_t  ngx_http_fancyindex_commands[] = {
       ngx_conf_set_enum_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_fancyindex_loc_conf_t, default_sort),
-      &ngx_http_fancyindex_sort_criteria },
+      &ngx_http_fancyindex_sort_attributes },
+
+    { ngx_string("fancyindex_default_descending"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_fancyindex_loc_conf_t, default_desc),
+      NULL },
 
     { ngx_string("fancyindex_directories_first"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
@@ -298,11 +312,25 @@ static ngx_command_t  ngx_http_fancyindex_commands[] = {
       offsetof(ngx_http_fancyindex_loc_conf_t, dirs_first),
       NULL },
 
+    { ngx_string("fancyindex_natural_sort"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_fancyindex_loc_conf_t, nat_sort),
+      NULL },
+
     { ngx_string("fancyindex_localtime"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_fancyindex_loc_conf_t, localtime),
+      NULL },
+
+    { ngx_string("fancyindex_time_format"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_fancyindex_loc_conf_t, time_format),
       NULL },
 
     { ngx_string("fancyindex_exact_size"),
@@ -359,13 +387,6 @@ static ngx_command_t  ngx_http_fancyindex_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_fancyindex_loc_conf_t, show_path),
-      NULL },
-
-    { ngx_string("fancyindex_time_format"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_str_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_fancyindex_loc_conf_t, time_format),
       NULL },
 
     ngx_null_command
@@ -551,7 +572,6 @@ make_content_buf(
 {
     ngx_http_fancyindex_entry_t *entry;
 
-    ngx_int_t (*sort_cmp_func) (const void*, const void*);
     const char  *sort_url_args = "";
 
     off_t        length;
@@ -571,7 +591,7 @@ make_content_buf(
                                      1024LL * 1024LL * 1024LL;
 
     /*
-     * NGX_DIR_MASK_LEN is lesser than NGX_HTTP_FANCYINDEX_PREALLOCATE
+     * NGX_DIR_MASK_LEN is less than NGX_HTTP_FANCYINDEX_PREALLOCATE
      */
     if ((last = ngx_http_map_uri_to_path(r, &path, &root,
                     NGX_HTTP_FANCYINDEX_PREALLOCATE)) == NULL)
@@ -737,22 +757,14 @@ make_content_buf(
     /*
      * Calculate needed buffer length.
      */
+    len = r->uri.len
+        + ngx_sizeof_ssz(t06_list1)
+        + ngx_sizeof_ssz(t_parentdir_entry)
+        + ngx_sizeof_ssz(t07_list2)
+        + ngx_fancyindex_timefmt_calc_size (&alcf->time_format) * entries.nelts
+        ;
     if (alcf->show_path)
-        len = r->uri.len
-          + ngx_sizeof_ssz(t05_body2)
-          + ngx_sizeof_ssz(t06_list1)
-          + ngx_sizeof_ssz(t_parentdir_entry)
-          + ngx_sizeof_ssz(t07_list2)
-          + ngx_fancyindex_timefmt_calc_size (&alcf->time_format) * entries.nelts
-          ;
-   else
-        len = r->uri.len
-          + ngx_sizeof_ssz(t06_list1)
-          + ngx_sizeof_ssz(t_parentdir_entry)
-          + ngx_sizeof_ssz(t07_list2)
-          + ngx_fancyindex_timefmt_calc_size (&alcf->time_format) * entries.nelts
-          ;
-
+        len += ngx_sizeof_ssz(t05_body2);
     /*
      * If we are a the root of the webserver (URI =  "/" --> length of 1),
      * do not display the "Parent Directory" link.
@@ -764,7 +776,7 @@ make_content_buf(
     entry = entries.elts;
     for (i = 0; i < entries.nelts; i++) {
         /*
-         * Genearated table rows are as follows, unneeded whitespace
+         * Generated table rows are as follows, unneeded whitespace
          * is stripped out:
          *
          *   <tr>
@@ -798,95 +810,71 @@ make_content_buf(
      *
      * Where x={M,S,N} and y={A,D}
      */
+
+    ngx_http_fancyindex_sortopts_t options = {
+        alcf->default_sort,
+        alcf->default_desc,
+        alcf->nat_sort,
+        alcf->dirs_first
+    };
+
     if ((r->args.len == 3 || (r->args.len == 7 && r->args.data[3] == '&')) &&
         r->args.data[0] == 'C' && r->args.data[1] == '=')
     {
-        /* Determine whether the direction of the sorting */
+        /* Determine the direction of sorting */
         ngx_int_t sort_descending = r->args.len == 7
                                  && r->args.data[4] == 'O'
                                  && r->args.data[5] == '='
                                  && r->args.data[6] == 'D';
 
+        options.descending = sort_descending;
+
         /* Pick the sorting criteria */
+
         switch (r->args.data[2]) {
             case 'M': /* Sort by mtime */
-                if (sort_descending) {
-                    sort_cmp_func = ngx_http_fancyindex_cmp_entries_mtime_desc;
-                    if (alcf->default_sort != NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE_DESC)
-                        sort_url_args = "?C=M&amp;O=D";
-                }
-                else {
-                    sort_cmp_func = ngx_http_fancyindex_cmp_entries_mtime_asc;
-                    if (alcf->default_sort != NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE)
-                        sort_url_args = "?C=M&amp;O=A";
+                options.type = NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_DATE;
+                if (options.type != alcf->default_sort
+                || options.descending != alcf->default_desc) {
+                    if (sort_descending) sort_url_args = "?C=M&amp;O=D";
+                    else sort_url_args = "?C=M&amp;O=A";
                 }
                 break;
             case 'S': /* Sort by size */
-                if (sort_descending) {
-                    sort_cmp_func = ngx_http_fancyindex_cmp_entries_size_desc;
-                    if (alcf->default_sort != NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE_DESC)
-                        sort_url_args = "?C=S&amp;O=D";
-                }
-                else {
-                    sort_cmp_func = ngx_http_fancyindex_cmp_entries_size_asc;
-                        if (alcf->default_sort != NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE)
-                    sort_url_args = "?C=S&amp;O=A";
+                options.type = NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_SIZE;
+                if (options.type != alcf->default_sort
+                || options.descending != alcf->default_desc) {
+                    if (sort_descending) sort_url_args = "?C=S&amp;O=D";
+                    else sort_url_args = "?C=S&amp;O=A";
                 }
                 break;
             case 'N': /* Sort by name */
+                options.type = NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_NAME;
+                __attribute__ ((fallthrough));
             default:
-                if (sort_descending) {
-                    sort_cmp_func = ngx_http_fancyindex_cmp_entries_name_desc;
-                    if (alcf->default_sort != NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME_DESC)
-                        sort_url_args = "?C=N&amp;O=D";
+                if (options.type != alcf->default_sort
+                || options.descending != alcf->default_desc) {
+                    if (sort_descending) sort_url_args = "?C=N&amp;O=D";
+                    else sort_url_args = "?C=N&amp;O=A";
                 }
-                else {
-                    sort_cmp_func = ngx_http_fancyindex_cmp_entries_name_asc;
-                    if (alcf->default_sort != NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME)
-                        sort_url_args = "?C=N&amp;O=A";
-                }
-                break;
-        }
-    }
-    else {
-        switch (alcf->default_sort) {
-            case NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE_DESC:
-                sort_cmp_func = ngx_http_fancyindex_cmp_entries_mtime_desc;
-                break;
-            case NGX_HTTP_FANCYINDEX_SORT_CRITERION_DATE:
-                sort_cmp_func = ngx_http_fancyindex_cmp_entries_mtime_asc;
-                break;
-            case NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE_DESC:
-                sort_cmp_func = ngx_http_fancyindex_cmp_entries_size_desc;
-                break;
-            case NGX_HTTP_FANCYINDEX_SORT_CRITERION_SIZE:
-                sort_cmp_func = ngx_http_fancyindex_cmp_entries_size_asc;
-                break;
-            case NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME_DESC:
-                sort_cmp_func = ngx_http_fancyindex_cmp_entries_name_desc;
-                break;
-            case NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME:
-            default:
-                sort_cmp_func = ngx_http_fancyindex_cmp_entries_name_asc;
                 break;
         }
     }
 
     /* Sort entries, if needed */
     if (entries.nelts > 1) {
-        /* Use ngx_sort for stability */ 
-        ngx_sort(entry, (size_t) entries.nelts,
-                  sizeof(ngx_http_fancyindex_entry_t),
-                  sort_cmp_func);
-
-        if (alcf->dirs_first)
-        {
-            /* Sort directories first */
-            ngx_sort(entry, (size_t) entries.nelts,
-                      sizeof(ngx_http_fancyindex_entry_t),
-                      ngx_http_fancyindex_cmp_entries_dirs_first);
-        }
-
+    #if defined(__clang__)
+        qsort_r(entry, (size_t) entries.nelts,
+                sizeof(ngx_http_fancyindex_entry_t),
+                &options,
+                ngx_http_fancyindex_cmp_entries);
+    #elif defined(__GNUC__)
+        qsort_r(entry, (size_t) entries.nelts,
+                sizeof(ngx_http_fancyindex_entry_t),
+                ngx_http_fancyindex_cmp_entries,
+                &options);
+    #endif
+    // good luck otherwise!
     }
 
     /* Display the path, if needed */
@@ -911,7 +899,7 @@ make_content_buf(
                                  ngx_sizeof_ssz("?C=N&amp;O=A"));
         }
         b->last = ngx_cpymem_ssz(b->last,
-                                 "\">Parent directory/</a></td>"
+                                 "\">Parent directory</a></td>"
                                  "<td>-</td>"
                                  "<td>-</td>"
                                  "</tr>");
@@ -1195,81 +1183,45 @@ add_builtin_header:
     return (r != r->main) ? rc : ngx_http_send_special(r, NGX_HTTP_LAST);
 }
 
-static ngx_int_t ngx_libc_cdecl
-ngx_http_fancyindex_cmp_entries_dirs_first(const void *one, const void *two)
+static int ngx_libc_cdecl
+#if defined(__clang__)
+ngx_http_fancyindex_cmp_entries(void *o, const void *one, const void *two)
+#elif defined(__GNUC__)
+ngx_http_fancyindex_cmp_entries(const void *one, const void *two, void *o)
+#endif
 {
     ngx_http_fancyindex_entry_t *first = (ngx_http_fancyindex_entry_t *) one;
     ngx_http_fancyindex_entry_t *second = (ngx_http_fancyindex_entry_t *) two;
 
-    /* move the directories to the start */
-    if (first->dir && !second->dir) {
-        return -1;
+    ngx_http_fancyindex_sortopts_t *opt = (ngx_http_fancyindex_sortopts_t *) o;
+
+    if (opt->dirs_first) {
+        if (first->dir && !second->dir) return -1;
+        if (!first->dir && second->dir) return 1;
     }
-    if (!first->dir && second->dir) {
-        return 1;
+
+    int result;
+
+    switch (opt->type) {
+        case NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_DATE:
+            result = first->mtime - second->mtime;
+            break;
+        case NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_SIZE:
+            result = (first->size > second->size) - (first->size < second->size);
+            break;
+        case NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_NAME:
+            if (opt->natural)
+                result = strnatcasecmp((const char *)first->name.data,
+                    (const char *)second->name.data);
+            else
+                result = ngx_strcmp(first->name.data, second->name.data);
+            break;
+        default:
+            return 0; // never
     }
 
-    return 0;
-}
-
-
-static ngx_int_t ngx_libc_cdecl
-ngx_http_fancyindex_cmp_entries_name_desc(const void *one, const void *two)
-{
-    ngx_http_fancyindex_entry_t *first = (ngx_http_fancyindex_entry_t *) one;
-    ngx_http_fancyindex_entry_t *second = (ngx_http_fancyindex_entry_t *) two;
-
-    return (int) ngx_strcmp(second->name.data, first->name.data);
-}
-
-
-static ngx_int_t ngx_libc_cdecl
-ngx_http_fancyindex_cmp_entries_size_desc(const void *one, const void *two)
-{
-    ngx_http_fancyindex_entry_t *first = (ngx_http_fancyindex_entry_t *) one;
-    ngx_http_fancyindex_entry_t *second = (ngx_http_fancyindex_entry_t *) two;
-
-    return (first->size > second->size) - (first->size < second->size);
-}
-
-
-static ngx_int_t ngx_libc_cdecl
-ngx_http_fancyindex_cmp_entries_mtime_desc(const void *one, const void *two)
-{
-    ngx_http_fancyindex_entry_t *first = (ngx_http_fancyindex_entry_t *) one;
-    ngx_http_fancyindex_entry_t *second = (ngx_http_fancyindex_entry_t *) two;
-
-    return (int) (second->mtime - first->mtime);
-}
-
-
-static ngx_int_t ngx_libc_cdecl
-ngx_http_fancyindex_cmp_entries_name_asc(const void *one, const void *two)
-{
-    ngx_http_fancyindex_entry_t *first = (ngx_http_fancyindex_entry_t *) one;
-    ngx_http_fancyindex_entry_t *second = (ngx_http_fancyindex_entry_t *) two;
-
-    return (int) ngx_strcmp(first->name.data, second->name.data);
-}
-
-
-static ngx_int_t ngx_libc_cdecl
-ngx_http_fancyindex_cmp_entries_size_asc(const void *one, const void *two)
-{
-    ngx_http_fancyindex_entry_t *first = (ngx_http_fancyindex_entry_t *) one;
-    ngx_http_fancyindex_entry_t *second = (ngx_http_fancyindex_entry_t *) two;
-
-    return (first->size > second->size) - (first->size < second->size);
-}
-
-
-static ngx_int_t ngx_libc_cdecl
-ngx_http_fancyindex_cmp_entries_mtime_asc(const void *one, const void *two)
-{
-    ngx_http_fancyindex_entry_t *first = (ngx_http_fancyindex_entry_t *) one;
-    ngx_http_fancyindex_entry_t *second = (ngx_http_fancyindex_entry_t *) two;
-
-    return (int) (first->mtime - second->mtime);
+    if (opt->descending) result *= -1;
+    return result;
 }
 
 
@@ -1308,10 +1260,12 @@ ngx_http_fancyindex_create_loc_conf(ngx_conf_t *cf)
      */
     conf->enable        = NGX_CONF_UNSET;
     conf->default_sort  = NGX_CONF_UNSET_UINT;
+    conf->default_desc  = NGX_CONF_UNSET;
     conf->dirs_first    = NGX_CONF_UNSET;
     conf->localtime     = NGX_CONF_UNSET;
     conf->name_length   = NGX_CONF_UNSET_UINT;
     conf->exact_size    = NGX_CONF_UNSET;
+    conf->nat_sort      = NGX_CONF_UNSET;
     conf->ignore        = NGX_CONF_UNSET_PTR;
     conf->hide_symlinks = NGX_CONF_UNSET;
     conf->show_path     = NGX_CONF_UNSET;
@@ -1329,25 +1283,28 @@ ngx_http_fancyindex_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     (void) cf; /* unused */
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
-    ngx_conf_merge_uint_value(conf->default_sort, prev->default_sort, NGX_HTTP_FANCYINDEX_SORT_CRITERION_NAME);
+    ngx_conf_merge_uint_value(conf->default_sort, prev->default_sort,
+        NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_NAME);
+    ngx_conf_merge_value(conf->default_desc, prev->default_desc, 0);
     ngx_conf_merge_value(conf->dirs_first, prev->dirs_first, 1);
+    ngx_conf_merge_value(conf->nat_sort, prev->nat_sort, 0);
     ngx_conf_merge_value(conf->localtime, prev->localtime, 0);
     ngx_conf_merge_value(conf->exact_size, prev->exact_size, 1);
     ngx_conf_merge_value(conf->show_path, prev->show_path, 1);
     ngx_conf_merge_uint_value(conf->name_length, prev->name_length, 50);
-
     ngx_conf_merge_str_value(conf->header, prev->header, "");
     ngx_conf_merge_str_value(conf->footer, prev->footer, "");
     ngx_conf_merge_str_value(conf->css_href, prev->css_href, "");
     ngx_conf_merge_str_value(conf->time_format, prev->time_format, "%Y-%b-%d %H:%M");
-
     ngx_conf_merge_ptr_value(conf->ignore, prev->ignore, NULL);
     ngx_conf_merge_value(conf->hide_symlinks, prev->hide_symlinks, 0);
 
-    /* Just make sure we haven't disabled the show_path directive without providing a custom header */
+    /* Just make sure we haven't disabled the show_path
+        directive without providing a custom header */
     if (conf->show_path == 0 && conf->header.len == 0)
     {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "FancyIndex : cannot set show_path to off without providing a custom header !");
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "FancyIndex : cannot set show_path to off without providing a custom header !");
         return NGX_CONF_ERROR;
     }
 
