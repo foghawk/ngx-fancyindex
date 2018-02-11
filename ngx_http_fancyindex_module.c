@@ -849,8 +849,7 @@ make_content_buf(
                 }
                 break;
             case 'N': /* Sort by name */
-                options.type = NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_NAME;
-                __attribute__ ((fallthrough));
+                options.type = NGX_HTTP_FANCYINDEX_SORT_ATTRIBUTE_NAME; // fall through
             default:
                 if (options.type != alcf->default_sort
                 || options.descending != alcf->default_desc) {
