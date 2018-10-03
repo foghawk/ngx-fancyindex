@@ -255,7 +255,7 @@ static char *ngx_http_fancyindex_ignore(ngx_conf_t    *cf,
                                         void          *conf);
 
 static uintptr_t
-    ngx_fancyindex_escape_uri(u_char *dst, u_char*src, size_t size);
+    ngx_fancyindex_escape_filename(u_char *dst, u_char*src, size_t size);
 
 /*
  * These are used only once per handler invocation. We can tell GCC to
@@ -431,8 +431,15 @@ static const ngx_str_t css_href_post =
     ngx_string("\" type=\"text/css\"/>\n");
 
 
+#ifdef NGX_ESCAPE_URI_COMPONENT
+static inline uintptr_t
+ngx_fancyindex_escape_filename(u_char *dst, u_char *src, size_t size)
+{
+    return ngx_escape_uri(dst, src, size, NGX_ESCAPE_URI_COMPONENT);
+}
+#else /* !NGX_ESCAPE_URI_COMPONENT */
 static uintptr_t
-ngx_fancyindex_escape_uri(u_char *dst, u_char *src, size_t size)
+ngx_fancyindex_escape_filename(u_char *dst, u_char *src, size_t size)
 {
     /*
      * The ngx_escape_uri() function will not escape colons or the
@@ -504,6 +511,7 @@ ngx_fancyindex_escape_uri(u_char *dst, u_char *src, size_t size)
         return escapes + uescapes;
     }
 }
+#endif /* NGX_ESCAPE_URI_COMPONENT */
 
 
 static ngx_inline ngx_buf_t*
@@ -736,9 +744,9 @@ make_content_buf(
             return ngx_http_fancyindex_error(r, &dir, &path);
 
         ngx_cpystrn(entry->name.data, ngx_de_name(&dir), len + 1);
-        entry->escape = 2 * ngx_fancyindex_escape_uri(NULL,
-                                                      ngx_de_name(&dir),
-                                                      len);
+        entry->escape = 2 * ngx_fancyindex_escape_filename(NULL,
+                                                           ngx_de_name(&dir),
+                                                           len);
 
         entry->dir     = ngx_de_is_dir(&dir);
         entry->mtime   = ngx_de_mtime(&dir);
@@ -784,7 +792,7 @@ make_content_buf(
          *     <td>size</td><td>date</td>
          *   </tr>
          */
-        len += ngx_sizeof_ssz("<tr><td><a href=\"")
+        len += ngx_sizeof_ssz("<tr><td class=\"link\"><a href=\"")
             + entry[i].name.len + entry[i].escape /* Escaped URL */
             + ngx_sizeof_ssz("?C=x&amp;O=y") /* URL sorting arguments */
             + ngx_sizeof_ssz("\" title=\"")
@@ -792,9 +800,9 @@ make_content_buf(
             + ngx_sizeof_ssz("\">")
             + entry[i].name.len + entry[i].utf_len
             + alcf->name_length + ngx_sizeof_ssz("&gt;")
-            + ngx_sizeof_ssz("</a></td><td>")
+            + ngx_sizeof_ssz("</a></td><td class=\"size\">")
             + 20 /* File size */
-            + ngx_sizeof_ssz("</td><td>")    /* Date prefix */
+            + ngx_sizeof_ssz("</td><td class=\"date\">")    /* Date prefix */
             + ngx_sizeof_ssz("</td></tr>\n") /* Date suffix */
             + 2 /* CR LF */
             ;
@@ -891,7 +899,7 @@ make_content_buf(
     if (r->uri.len > 1) {
         b->last = ngx_cpymem_ssz(b->last,
                                  "<tr>"
-                                 "<td><a href=\"../");
+                                 "<td class=\"link\"><a href=\"../");
         if (*sort_url_args) {
             b->last = ngx_cpymem(b->last,
                                  sort_url_args,
@@ -899,19 +907,19 @@ make_content_buf(
         }
         b->last = ngx_cpymem_ssz(b->last,
                                  "\">Parent directory</a></td>"
-                                 "<td>-</td>"
-                                 "<td>-</td>"
+                                 "<td class=\"size\">-</td>"
+                                 "<td class=\"date\">-</td>"
                                  "</tr>");
     }
 
     /* Entries for directories and files */
     for (i = 0; i < entries.nelts; i++) {
-        b->last = ngx_cpymem_ssz(b->last, "<tr><td><a href=\"");
+        b->last = ngx_cpymem_ssz(b->last, "<tr><td class=\"link\"><a href=\"");
 
         if (entry[i].escape) {
-            ngx_fancyindex_escape_uri(b->last,
-                                      entry[i].name.data,
-                                      entry[i].name.len);
+            ngx_fancyindex_escape_filename(b->last,
+                                           entry[i].name.data,
+                                           entry[i].name.len);
 
             b->last += entry[i].name.len + entry[i].escape;
 
@@ -954,7 +962,7 @@ make_content_buf(
         }
 
         if (len > alcf->name_length) {
-            b->last = ngx_cpymem_ssz(last, "..&gt;</a></td><td>");
+            b->last = ngx_cpymem_ssz(last, "..&gt;</a></td><td class=\"size\">");
 
         } else {
             if (entry[i].dir && alcf->name_length - len > 0) {
@@ -962,7 +970,7 @@ make_content_buf(
                 len++;
             }
 
-            b->last = ngx_cpymem_ssz(b->last, "</a></td><td>");
+            b->last = ngx_cpymem_ssz(b->last, "</a></td><td class=\"size\">");
         }
 
         if (alcf->exact_size) {
@@ -992,7 +1000,7 @@ make_content_buf(
         }
 
         ngx_gmtime(entry[i].mtime + tp->gmtoff * 60 * alcf->localtime, &tm);
-        b->last = ngx_cpymem_ssz(b->last, "</td><td>");
+        b->last = ngx_cpymem_ssz(b->last, "</td><td class=\"date\">");
         b->last = ngx_fancyindex_timefmt(b->last, &alcf->time_format, &tm);
         b->last = ngx_cpymem_ssz(b->last, "</td></tr>");
 
